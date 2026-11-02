@@ -1,0 +1,38 @@
+{
+    "camera": {
+        "source_type": "webcam",
+        "source": 0,
+        "rotate": 0,
+        "fps": 30,
+        "resolution": "1280x720"
+    },
+    "paths": {
+        "segment_config": "segment_config.json",
+        "roi_config": "roi_config.json",
+        "save_directory": "C:/Users/Evgenii/Desktop/Спектрофотометр_данные"
+    },
+    "hsv": {
+        "lower": [
+            54,
+            114,
+            100
+        ],
+        "upper": [
+            179,
+            255,
+            255
+        ]
+    },
+    "recognition": {
+        "fill_threshold_digit": 0.3,
+        "fill_threshold_point": 0.2,
+        "segment_size": 9,
+        "wavelength_jump_threshold": 5.0,
+        "min_wavelength": 200.0
+    },
+    "gui": {
+        "base_width": 1920,
+        "base_height": 1080,
+        "font_size": 24
+    }
+}
