@@ -6,6 +6,7 @@ from matplotlib.figure import Figure
 from PIL import Image, ImageTk
 import numpy as np
 import os
+import time
 import cv2
 import threading
 
@@ -20,7 +21,6 @@ class MainApp:
     def __init__(self, root, camera, config):
         self.root = root
         self.root.title("Спектрофотометр")
-        self.root.geometry("1920x1080")
 
         self.camera = camera
         self.config = config
@@ -28,6 +28,21 @@ class MainApp:
         self.base_width = config.get('gui', 'base_width', default=1920)
         self.base_height = config.get('gui', 'base_height', default=1080)
         self.font_size = config.get('gui', 'font_size', default=24)
+
+        # ---- Размер и положение окна: половина экрана, по центру ----
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = screen_w // 2
+        win_h = screen_h // 2
+        min_w, min_h = 800, 600
+        if win_w < min_w:
+            win_w = min_w
+        if win_h < min_h:
+            win_h = min_h
+        pos_x = (screen_w - win_w) // 2
+        pos_y = (screen_h - win_h) // 2
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        self.root.minsize(min_w, min_h)
 
         self.pages = {}
         self.current_page = None
@@ -47,8 +62,8 @@ class MainApp:
         self.raw_wavelengths = []
         self.raw_transmittances = []
 
-        self.segment_config = load_json(config.get('paths', 'segment_config', default='segment_config.json'))
-        self.roi_config = load_json(config.get('paths', 'roi_config', default='roi_config.json'))
+        self.segment_config = load_json(config.get_absolute_path('segment_config'))
+        self.roi_config = load_json(config.get_absolute_path('roi_config'))
 
         self.create_tab_buttons()
         self.create_pages()
@@ -56,8 +71,7 @@ class MainApp:
         self.root.bind("<Configure>", self.on_resize)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.auto_connect_camera()
-        self.start_video()
+        self._no_frame_count = 0
         self._update_camera_buttons()
 
     # ---------- Масштабирование ----------
@@ -131,48 +145,13 @@ class MainApp:
             else:
                 btn.config(relief=tk.RAISED, bg='lightgray')
 
-    # ---------- Автоподключение камеры ----------
-    def auto_connect_camera(self):
-        source_type = self.config.get('camera', 'source_type', default='webcam')
-        source = self.config.get('camera', 'source', default=0)
-        rotate_code = self.config.get_camera_rotate_code()
-
-        self.camera.source_type = source_type
-        self.camera.source = source
-        self.camera.rotate_code = rotate_code
-
-        if not self.camera.connect():
-            print("Не удалось автоматически подключить камеру")
-            self.video_running = False
-            return
-
-        # Применяем сохранённые FPS и разрешение
-        try:
-            resolution = self.config.get('camera', 'resolution', default='640x480')
-            w, h = map(int, resolution.split('x'))
-            self.camera.set_resolution(w, h)
-        except Exception as e:
-            print(f"Не удалось применить разрешение: {e}")
-
-        try:
-            fps = int(self.config.get('camera', 'fps', default=30))
-            self.camera.set_fps(fps)
-        except Exception as e:
-            print(f"Не удалось применить FPS: {e}")
-
-        print("Камера автоматически подключена")
-        self.video_running = True
-        self._update_camera_buttons()
-
     # ---------- Страница измерения ----------
     def setup_measurement_page(self, page):
-        # Инициализация списков данных
         self.measurement_wavelengths = []
         self.measurement_transmittances = []
         self.raw_wavelengths = []
         self.raw_transmittances = []
 
-        # ===== Верхняя панель: ROI + название + кнопки =====
         self.measurement_top_panel = tk.Frame(page, height=150)
         self.measurement_top_panel.pack(fill=tk.X, padx=10, pady=5)
         self.measurement_top_panel.pack_propagate(False)
@@ -199,11 +178,9 @@ class MainApp:
                                               font=('Arial', self.font_size), bg='lightcoral',
                                               state=tk.DISABLED)
 
-        # ===== Основная область: график слева + параметры справа =====
         chart_controls = tk.Frame(page)
         chart_controls.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # --- График (слева) ---
         graph_frame = tk.Frame(chart_controls)
         graph_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -215,12 +192,10 @@ class MainApp:
         self.measurement_canvas = FigureCanvasTkAgg(self.measurement_fig, master=graph_frame)
         self.measurement_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # --- Панель параметров (справа) ---
         controls_frame = tk.LabelFrame(chart_controls, text="Параметры измерения",
                                        font=('Arial', 12))
         controls_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
 
-        # Mode
         tk.Label(controls_frame, text="Mode:", font=('Arial', 12)).grid(
             row=0, column=0, sticky='w', padx=5, pady=8)
         self.mode_var = tk.StringVar(value='Transmission')
@@ -229,7 +204,6 @@ class MainApp:
         mode_menu.config(font=('Arial', 12), width=14)
         mode_menu.grid(row=0, column=1, sticky='w', padx=5, pady=8)
 
-        # Scan speed
         tk.Label(controls_frame, text="Scan speed:", font=('Arial', 12)).grid(
             row=1, column=0, sticky='w', padx=5, pady=8)
         speed_frame = tk.Frame(controls_frame)
@@ -239,7 +213,6 @@ class MainApp:
                  font=('Arial', 12)).pack(side=tk.LEFT)
         tk.Label(speed_frame, text=" nm/min", font=('Arial', 12)).pack(side=tk.LEFT)
 
-        # Scale
         tk.Label(controls_frame, text="Scale:", font=('Arial', 12)).grid(
             row=2, column=0, sticky='w', padx=5, pady=8)
         scale_frame = tk.Frame(controls_frame)
@@ -253,14 +226,12 @@ class MainApp:
                  font=('Arial', 12)).pack(side=tk.LEFT)
         tk.Label(scale_frame, text=" %", font=('Arial', 12)).pack(side=tk.LEFT)
 
-        # Comment
         tk.Label(controls_frame, text="Comment:", font=('Arial', 12)).grid(
             row=3, column=0, sticky='w', padx=5, pady=8)
         self.comment_var = tk.StringVar(value='')
         tk.Entry(controls_frame, textvariable=self.comment_var, width=22,
                  font=('Arial', 12)).grid(row=3, column=1, sticky='w', padx=5, pady=8)
 
-        # --- Частота обновления графика (с отступом сверху) ---
         tk.Label(controls_frame, text="Graph update:", font=('Arial', 12)).grid(
             row=4, column=0, sticky='w', padx=5, pady=(40, 8))
         self.graph_update_var = tk.StringVar(value='1')
@@ -273,7 +244,6 @@ class MainApp:
                  font=('Arial', 9), fg='gray').grid(
             row=5, column=1, sticky='w', padx=5, pady=(0, 8))
 
-        # Счётчик для графика
         self.graph_update_counter = 0
 
         self.update_measurement_layout()
@@ -316,7 +286,6 @@ class MainApp:
             messagebox.showerror("Ошибка", "Введите название спектра")
             return
 
-        # ---- Чтение параметров ----
         mode = self.mode_var.get()
         try:
             scan_speed = float(self.scan_speed_var.get())
@@ -331,12 +300,11 @@ class MainApp:
             return
         comment = self.comment_var.get()
 
-        # ОЧИСТКА графиков
         self.measurement_wavelengths = []
         self.measurement_transmittances = []
         self.raw_wavelengths = []
         self.raw_transmittances = []
-        self.graph_update_counter = 0   # <-- сброс счётчика
+        self.graph_update_counter = 0
         self.update_measurement_plot()
 
         hsv_lower, hsv_upper = self.config.get_hsv_ranges()
@@ -407,7 +375,6 @@ class MainApp:
         self.measurement_wavelengths = list(wl_proc)
         self.measurement_transmittances = list(tr_proc)
 
-        # Обновляем график не каждый раз, а каждый N-й замер
         try:
             n = int(self.graph_update_var.get())
         except (ValueError, AttributeError):
@@ -422,17 +389,17 @@ class MainApp:
     def update_measurement_plot(self):
         self.measurement_ax.clear()
 
-        if self.measurement_wavelengths:
-            self.measurement_ax.plot(
-                self.measurement_wavelengths, self.measurement_transmittances,
-                '-', linewidth=1.5, color='red', label='processed', zorder=2
-            )
-
         if self.raw_wavelengths:
             self.measurement_ax.plot(
                 self.raw_wavelengths, self.raw_transmittances,
                 'o', markersize=3, color='#1fa80a', alpha=0.6,
-                label='raw', zorder=3
+                label='raw', zorder=1
+            )
+
+        if self.measurement_wavelengths:
+            self.measurement_ax.plot(
+                self.measurement_wavelengths, self.measurement_transmittances,
+                '-', linewidth=1.5, color='red', label='processed', zorder=2
             )
 
         self.measurement_ax.set_xlabel("Длина волны, нм")
@@ -473,7 +440,6 @@ class MainApp:
         camera_panel = tk.Frame(page)
         camera_panel.pack(fill=tk.X, padx=10, pady=5)
 
-        # --- Ряд 1: тип, источник, поворот, кнопка подключения, статус ---
         row1 = tk.Frame(camera_panel)
         row1.pack(fill=tk.X, pady=2)
 
@@ -509,28 +475,159 @@ class MainApp:
         self.camera_status_label = tk.Label(row1, text="Статус: не подключено", font=('Arial', 12))
         self.camera_status_label.pack(side=tk.LEFT, padx=10)
 
-        # --- Ряд 2: FPS и разрешение ---
-        row2 = tk.Frame(camera_panel)
-        row2.pack(fill=tk.X, pady=2)
+        # --- Row 3: X / Y / W / H + Свойства драйвера ---
+        row3 = tk.Frame(camera_panel)
+        row3.pack(fill=tk.X, pady=2)
 
-        tk.Label(row2, text="FPS:", font=('Arial', 12)).pack(side=tk.LEFT, padx=5)
-        self.fps_var = tk.StringVar(value=str(self.config.get('camera', 'fps', default=30)))
-        fps_menu = tk.OptionMenu(row2, self.fps_var, "5", "10", "15", "20", "24", "30", "60")
-        fps_menu.config(font=('Arial', 12), width=5)
-        fps_menu.pack(side=tk.LEFT)
-
-        tk.Label(row2, text="Разрешение:", font=('Arial', 12)).pack(side=tk.LEFT, padx=(30, 5))
-        self.resolution_var = tk.StringVar(
-            value=self.config.get('camera', 'resolution', default='640x480')
+        self.crop_enabled_var = tk.BooleanVar(
+            value=bool(self.config.get('camera', 'crop', default=None))
         )
-        res_menu = tk.OptionMenu(row2, self.resolution_var,
-                                 "320x240", "640x480", "800x600", "1280x720", "1920x1080")
-        res_menu.config(font=('Arial', 12), width=10)
-        res_menu.pack(side=tk.LEFT)
+        tk.Checkbutton(row3, text="Crop включён:",
+                       variable=self.crop_enabled_var,
+                       command=self.on_crop_toggle,
+                       font=('Arial', 12)).pack(side=tk.LEFT, padx=5)
+
+        tk.Label(row3, text="X:", font=('Arial', 12)).pack(side=tk.LEFT)
+        self.crop_x_var = tk.StringVar(value="0")
+        tk.Entry(row3, textvariable=self.crop_x_var, width=6,
+                 font=('Arial', 12)).pack(side=tk.LEFT)
+
+        tk.Label(row3, text="Y:", font=('Arial', 12)).pack(side=tk.LEFT)
+        self.crop_y_var = tk.StringVar(value="0")
+        tk.Entry(row3, textvariable=self.crop_y_var, width=6,
+                 font=('Arial', 12)).pack(side=tk.LEFT)
+
+        tk.Label(row3, text="W:", font=('Arial', 12)).pack(side=tk.LEFT)
+        self.crop_w_var = tk.StringVar(value="640")
+        tk.Entry(row3, textvariable=self.crop_w_var, width=6,
+                 font=('Arial', 12)).pack(side=tk.LEFT)
+
+        tk.Label(row3, text="H:", font=('Arial', 12)).pack(side=tk.LEFT)
+        self.crop_h_var = tk.StringVar(value="480")
+        tk.Entry(row3, textvariable=self.crop_h_var, width=6,
+                 font=('Arial', 12)).pack(side=tk.LEFT)
+
+        tk.Button(row3, text="Применить", command=self.apply_crop,
+                  font=('Arial', 11), bg='lightblue').pack(side=tk.LEFT, padx=5)
+        tk.Button(row3, text="Сбросить", command=self.reset_crop_area,
+                  font=('Arial', 11)).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(row3, text="Свойства драйвера",
+                  command=self.open_driver_settings,
+                  font=('Arial', 11), bg='lightyellow').pack(side=tk.LEFT, padx=(20, 5))
+
+        # --- Row 4: стрелки перемещения + кнопки размера ---
+        row4 = tk.Frame(camera_panel)
+        row4.pack(fill=tk.X, pady=2)
+
+        tk.Label(row4, text="Позиция:", font=('Arial', 12)).pack(side=tk.LEFT, padx=5)
+        tk.Button(row4, text="←", width=2, font=('Arial', 12),
+                  command=lambda: self.move_crop(-10, 0)).pack(side=tk.LEFT)
+        tk.Button(row4, text="→", width=2, font=('Arial', 12),
+                  command=lambda: self.move_crop(10, 0)).pack(side=tk.LEFT)
+        tk.Button(row4, text="↑", width=2, font=('Arial', 12),
+                  command=lambda: self.move_crop(0, -10)).pack(side=tk.LEFT)
+        tk.Button(row4, text="↓", width=2, font=('Arial', 12),
+                  command=lambda: self.move_crop(0, 10)).pack(side=tk.LEFT)
+
+        tk.Label(row4, text="Масштаб:", font=('Arial', 12)).pack(side=tk.LEFT, padx=(20, 5))
+        tk.Button(row4, text="+", width=2, font=('Arial', 12),
+                  command=lambda: self.resize_crop(-10)).pack(side=tk.LEFT)
+        tk.Button(row4, text="-", width=2, font=('Arial', 12),
+                  command=lambda: self.resize_crop(10)).pack(side=tk.LEFT)
+
+        self.show_full_frame_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row4, text="Показать полный кадр",
+                       variable=self.show_full_frame_var,
+                       font=('Arial', 12)).pack(side=tk.LEFT, padx=(20, 5))
+
+        self.crop_info_var = tk.StringVar(value=self._get_crop_text())
+        tk.Label(row4, textvariable=self.crop_info_var,
+                 font=('Arial', 11), fg='gray').pack(side=tk.LEFT, padx=10)
 
         # --- Видео ---
         self.video_label = tk.Label(page, bg='black')
         self.video_label.pack(fill=tk.BOTH, expand=True)
+
+        # Загружаем сохранённый crop в поля ввода
+        self.load_crop_to_ui()
+
+    def _get_crop_text(self):
+        crop = self.config.get('camera', 'crop', default=None)
+        if not crop:
+            return "весь кадр"
+        return f"x={crop['x']}, y={crop['y']}, w={crop['w']}, h={crop['h']}"
+
+    def _get_text_crop(self, crop):
+        return f"x={crop['x']}, y={crop['y']}, w={crop['w']}, h={crop['h']}"
+
+    def load_crop_to_ui(self):
+        """Загружает сохранённый crop в поля ввода."""
+        crop = self.config.get('camera', 'crop', default=None)
+        if crop:
+            self.crop_x_var.set(str(crop['x']))
+            self.crop_y_var.set(str(crop['y']))
+            self.crop_w_var.set(str(crop['w']))
+            self.crop_h_var.set(str(crop['h']))
+            self.crop_enabled_var.set(True)
+
+    def on_crop_toggle(self):
+        if not self.crop_enabled_var.get():
+            self.config.set('camera', 'crop', value=None)
+            self.config.save()
+            self.camera.crop = None
+            self.crop_info_var.set("весь кадр")
+        else:
+            self.apply_crop()
+
+    def apply_crop(self):
+        try:
+            x = int(self.crop_x_var.get())
+            y = int(self.crop_y_var.get())
+            w = int(self.crop_w_var.get())
+            h = int(self.crop_h_var.get())
+        except ValueError:
+            messagebox.showerror("Ошибка", "X, Y, W, H должны быть целыми числами")
+            return
+        if w < 10 or h < 10:
+            messagebox.showerror("Ошибка", "W и H должны быть не меньше 10")
+            return
+        x = max(0, x); y = max(0, y)
+        crop = {'x': x, 'y': y, 'w': w, 'h': h}
+        self.config.set('camera', 'crop', value=crop)
+        self.config.save()
+        self.camera.crop = crop
+        self.crop_enabled_var.set(True)
+        self.crop_x_var.set(str(x))
+        self.crop_y_var.set(str(y))
+        self.crop_info_var.set(self._get_text_crop(crop))
+
+    def move_crop(self, dx, dy):
+        try:
+            x = int(self.crop_x_var.get()) + dx
+            y = int(self.crop_y_var.get()) + dy
+        except ValueError:
+            return
+        self.crop_x_var.set(str(max(0, x)))
+        self.crop_y_var.set(str(max(0, y)))
+        self.apply_crop()
+
+    def resize_crop(self, delta):
+        try:
+            w = int(self.crop_w_var.get()) + delta
+            h = int(self.crop_h_var.get()) + delta
+        except ValueError:
+            return
+        self.crop_w_var.set(str(max(10, w)))
+        self.crop_h_var.set(str(max(10, h)))
+        self.apply_crop()
+
+    def reset_crop_area(self):
+        self.config.set('camera', 'crop', value=None)
+        self.config.save()
+        self.camera.crop = None
+        self.crop_enabled_var.set(False)
+        self.crop_info_var.set("весь кадр")
 
     def on_camera_type_changed(self):
         if self.camera_type_var.get() == 'webcam':
@@ -554,13 +651,14 @@ class MainApp:
             self.camera.rotate_code = None
 
     def reconnect_camera(self):
-        # Сначала останавливаем старый цикл, чтобы не наплодить лишних
+        if self.measurement_running:
+            messagebox.showwarning(
+                "Внимание",
+                "Идёт измерение. Нажмите Stop или дождитесь окончания."
+            )
+            return
+
         self._stop_video_loop()
-        # Освобождаем камеру, если она была открыта
-        try:
-            self.camera.release()
-        except Exception:
-            pass
 
         source_type = self.camera_type_var.get()
         source = self.camera_source_entry.get()
@@ -574,87 +672,152 @@ class MainApp:
         self.camera.source_type = source_type
         self.camera.source = source
         self.camera.rotate_code = self.config.get_camera_rotate_code()
+        self.camera.crop = self.config.get('camera', 'crop', default=None)
 
-        if self.camera.connect():
-            # Применяем разрешение и FPS
-            try:
-                w, h = map(int, self.resolution_var.get().split('x'))
-                self.camera.set_resolution(w, h)
-            except Exception as e:
-                print(f"Не удалось установить разрешение: {e}")
+        ok = self.camera.connect()
+        if not ok:
+            # DSHOW иногда не отпускает устройство мгновенно — пробуем ещё раз
+            self.camera_status_label.config(text="Статус: повторная попытка...")
+            self.root.update_idletasks()
+            time.sleep(0.8)
+            ok = self.camera.connect()
 
-            try:
-                fps = int(self.fps_var.get())
-                self.camera.set_fps(fps)
-            except Exception as e:
-                print(f"Не удалось установить FPS: {e}")
-
+        if ok:
             self.camera_status_label.config(text="Статус: подключено")
             self.video_running = True
+            self._no_frame_count = 0
             self.update_video_frame()
 
-            # Сохраняем в конфиг
             self.config.set('camera', 'source_type', value=source_type)
             self.config.set('camera', 'source', value=source)
-            self.config.set('camera', 'fps', value=int(self.fps_var.get()))
-            self.config.set('camera', 'resolution', value=self.resolution_var.get())
             self.config.save()
         else:
             self.camera_status_label.config(text="Статус: ошибка подключения")
             self.video_running = False
-        
+
         self._update_camera_buttons()
 
     def start_video(self):
-        if self.video_running:
+        if self.video_running and self.video_after_id is not None:
             return
-        if self.camera.connected:
-            self.video_running = True
-            self.update_video_frame()
-        else:
-            if self.camera.connect():
-                self.video_running = True
-                self.camera_status_label.config(text="Статус: подключено")
-                self.update_video_frame()
-            else:
+        if not self.camera.connected:
+            if not self.camera.connect():
                 self.camera_status_label.config(text="Статус: не удалось подключить")
+                return
+            self.camera_status_label.config(text="Статус: подключено")
+        self.video_running = True
+        self.update_video_frame()
 
     def update_video_frame(self):
         if not self.video_running:
             self.video_after_id = None
             return
 
-        ret, frame = self.camera.read()
-        if ret:
-            if self.segment_config and self.roi_config:
-                roi1 = self.segment_config['rois'][0]
-                roi2 = self.segment_config['rois'][1]
-                cv2.rectangle(frame, (roi1['x'], roi1['y']),
-                              (roi1['x']+roi1['w'], roi1['y']+roi1['h']), (255,0,0), 2)
-                cv2.rectangle(frame, (roi2['x'], roi2['y']),
-                              (roi2['x']+roi2['w'], roi2['y']+roi2['h']), (0,255,0), 2)
-                for digit in roi1['digits']:
-                    for seg in digit['segments']:
-                        x = int(roi1['x'] + seg['x'] * roi1['w'])
-                        y = int(roi1['y'] + seg['y'] * roi1['h'])
-                        cv2.rectangle(frame, (x, y), (x+9, y+9), (0,255,255), 1)
-                for digit in roi2['digits']:
-                    for seg in digit['segments']:
-                        x = int(roi2['x'] + seg['x'] * roi2['w'])
-                        y = int(roi2['y'] + seg['y'] * roi2['h'])
-                        cv2.rectangle(frame, (x, y), (x+9, y+9), (0,255,255), 1)
+        crop = self.config.get('camera', 'crop', default=None)
+        crop_active = crop is not None and self.crop_enabled_var.get()
+        show_full = bool(self.show_full_frame_var.get())
+        apply_crop_now = crop_active and not show_full
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.video_label.imgtk = imgtk
-            self.video_label.configure(image=imgtk)
+        ret, frame = self.camera.read(apply_crop=apply_crop_now)
 
-        # Запоминаем id запланированного вызова
+        if not ret or frame is None:
+            self._no_frame_count += 1
+            if self._no_frame_count == 100:
+                self.camera_status_label.config(text="Статус: нет кадров, переподключаю...")
+                try:
+                    self.camera.release()
+                    self.camera.connect()
+                    self.camera_status_label.config(text="Статус: подключено")
+                except Exception as e:
+                    print(f"Автопереподключение не удалось: {e}")
+                self._no_frame_count = 0
+            self.video_after_id = self.root.after(30, self.update_video_frame)
+            return
+
+        self._no_frame_count = 0
+        fh, fw = frame.shape[:2]
+
+        # Затемнение вокруг crop — только в режиме «полный кадр»
+        if crop_active and show_full:
+            cx, cy = int(crop['x']), int(crop['y'])
+            cw, ch = int(crop['w']), int(crop['h'])
+            x2 = min(cx + cw, fw)
+            y2 = min(cy + ch, fh)
+            cx = max(0, cx); cy = max(0, cy)
+
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (fw, fh), (0, 0, 0), -1)
+            overlay[cy:y2, cx:x2] = frame[cy:y2, cx:x2]
+            frame = cv2.addWeighted(frame, 0.65, overlay, 0.35, 0)
+            cv2.rectangle(frame, (cx, cy), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"Crop {cw}x{ch}", (cx + 5, max(cy + 20, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # ROI-прямоугольники, сегменты и точка
+        if self.segment_config and self.roi_config:
+            roi1 = self.segment_config['rois'][0]
+            roi2 = self.segment_config['rois'][1]
+            if apply_crop_now:
+                off_x, off_y = 0, 0
+            else:
+                off_x = int(crop['x']) if crop_active else 0
+                off_y = int(crop['y']) if crop_active else 0
+
+            # Размер квадратиков сегментов — из segment_config (или 9 по умолчанию)
+            seg_size = int(self.segment_config.get('_seg_size', 9))
+            seg_size = max(5, min(seg_size, 40))
+
+            cv2.rectangle(frame,
+                          (off_x + roi1['x'], off_y + roi1['y']),
+                          (off_x + roi1['x'] + roi1['w'],
+                           off_y + roi1['y'] + roi1['h']),
+                          (255, 0, 0), 2)
+            cv2.rectangle(frame,
+                          (off_x + roi2['x'], off_y + roi2['y']),
+                          (off_x + roi2['x'] + roi2['w'],
+                           off_y + roi2['y'] + roi2['h']),
+                          (0, 255, 0), 2)
+
+            for roi_data in (roi1, roi2):
+                for digit in roi_data['digits']:
+                    for seg in digit['segments']:
+                        x = int(off_x + roi_data['x']
+                                + seg['x'] * roi_data['w'])
+                        y = int(off_y + roi_data['y']
+                                + seg['y'] * roi_data['h'])
+                        cv2.rectangle(frame, (x, y),
+                                      (x + seg_size, y + seg_size),
+                                      (0, 255, 255), 1)
+
+                # Точка (десятичный разделитель)
+                if 'point' in roi_data:
+                    px = int(off_x + roi_data['x']
+                             + roi_data['point']['x'] * roi_data['w'])
+                    py = int(off_y + roi_data['y']
+                             + roi_data['point']['y'] * roi_data['h'])
+                    cv2.rectangle(frame, (px, py),
+                                  (px + seg_size, py + seg_size),
+                                  (0, 128, 255), 1)   # оранжевый — чтобы отличать
+
+        # Масштаб под окно: fill = зум-эффект для обрезанного кадра
+        label_w = self.video_label.winfo_width()
+        label_h = self.video_label.winfo_height()
+        if label_w > 1 and label_h > 1:
+            scale = min(label_w / fw, label_h / fh)
+            new_w = max(1, int(fw * scale))
+            new_h = max(1, int(fh * scale))
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            frame = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+        imgtk = ImageTk.PhotoImage(image=img)
+        self.video_label.imgtk = imgtk
+        self.video_label.configure(image=imgtk)
+
         self.video_after_id = self.root.after(30, self.update_video_frame)
 
     def _stop_video_loop(self):
-        """Останавливает цикл обновления видео."""
         self.video_running = False
         if self.video_after_id is not None:
             try:
@@ -664,28 +827,17 @@ class MainApp:
             self.video_after_id = None
 
     def on_close(self):
-        """Вызывается при закрытии окна программы."""
-        # 1. Останавливаем цикл обновления видео
         self._stop_video_loop()
-
-        # 2. Останавливаем измерение, если оно идёт
         try:
             self.measurement_stop_event.set()
         except Exception:
             pass
-
-        # 3. Даём потоку измерения немного времени завершиться
-        #    (только если поток действительно запускался)
         if self.measurement_thread is not None and self.measurement_thread.is_alive():
             self.measurement_thread.join(timeout=2.0)
-
-        # 4. Освобождаем камеру
         try:
             self.camera.release()
         except Exception:
             pass
-
-        # 5. Уничтожаем окно Tkinter
         try:
             self.root.destroy()
         except Exception:
@@ -706,6 +858,24 @@ class MainApp:
         else:
             self.stop_camera_btn.config(state=tk.DISABLED)
 
+    def open_driver_settings(self):
+        """Открывает системный диалог свойств драйвера DirectShow.
+        Там доступны все параметры, которые поддерживает камера:
+        экспозиция, яркость, контраст, баланс белого, зум, фокус и т.п."""
+        if not self.camera.connected or self.camera.cap is None:
+            messagebox.showwarning(
+                "Камера не подключена",
+                "Сначала нажмите «Подключить», чтобы открыть камеру."
+            )
+            return
+        try:
+            self.camera.cap.set(cv2.CAP_PROP_SETTINGS, 1)
+        except Exception as e:
+            messagebox.showerror(
+                "Ошибка",
+                f"Не удалось открыть свойства драйвера: {e}"
+            )
+
     # ---------- Данные ----------
     def setup_data_view_page(self, page):
         button_panel = tk.Frame(page)
@@ -724,7 +894,6 @@ class MainApp:
         self.graph_listbox = tk.Listbox(page, width=40, height=5)
         self.graph_listbox.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
 
-        # Панель с метаданными выбранного графика
         self.metadata_frame = tk.LabelFrame(page, text="Информация о спектре",
                                             font=('Arial', 12))
         self.metadata_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
@@ -745,16 +914,9 @@ class MainApp:
         self.data_view_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True,
                                                    padx=10, pady=5)
 
-        # имя файла -> (wavelengths, transmittances, metadata_dict)
         self.loaded_graphs = {}
 
     def parse_spectrum_file(self, file_path):
-        """
-        Универсальный парсер CSV:
-        - читает метаданные из первых строк (Date, Mode, Scan speed, Scale, Comment),
-        - находит строку с заголовком 'Wavelength' и читает таблицу.
-        Поддерживает старый (только таблица) и новый (с метаданными) форматы.
-        """
         metadata = {
             'Date': '',
             'Mode': '',
@@ -768,7 +930,6 @@ class MainApp:
         with open(file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        # Ищем строку с заголовком 'Wavelength'
         data_start = None
         for i, line in enumerate(lines):
             if line.strip().lower().startswith('wavelength'):
@@ -778,7 +939,6 @@ class MainApp:
         if data_start is None:
             data_start = 0
 
-        # Собираем метаданные из строк до начала таблицы
         if data_start > 0:
             for line in lines[:data_start - 1]:
                 for key in metadata.keys():
@@ -787,7 +947,6 @@ class MainApp:
                         metadata[key] = line.strip()[len(prefix):].strip()
                         break
 
-        # Читаем данные
         for line in lines[data_start:]:
             parts = line.strip().split(';')
             if len(parts) < 2:
@@ -939,20 +1098,27 @@ class MainApp:
 
     def open_roi_config(self):
         rotate_code = self.config.get_camera_rotate_code()
+        crop = self.config.get('camera', 'crop', default=None)
+        seg_path = self.config.get_absolute_path('segment_config')
+        roi_path = self.config.get_absolute_path('roi_config')
         calibration.segment_calibration(
             camera_index=self.config.get('camera', 'source', default=0),
-            rotate_code=rotate_code
+            segment_file=seg_path, roi_file=roi_path,
+            rotate_code=rotate_code, crop=crop
         )
-        self.segment_config = load_json(self.config.get('paths', 'segment_config'))
-        self.roi_config = load_json(self.config.get('paths', 'roi_config'))
+        self.segment_config = load_json(seg_path)
+        self.roi_config = load_json(roi_path)
 
     def open_color_config(self):
         rotate_code = self.config.get_camera_rotate_code()
+        crop = self.config.get('camera', 'crop', default=None)
+        hsv_path = self.config.get_absolute_path('hsv_config')
         calibration.color_calibration(
             camera_index=self.config.get('camera', 'source', default=0),
-            rotate_code=rotate_code
+            config_file=hsv_path,
+            rotate_code=rotate_code, crop=crop
         )
-        hsv_config = load_json('hsv_config.json')
+        hsv_config = load_json(hsv_path)
         if hsv_config:
             self.config.set('hsv', 'lower',
                             value=[hsv_config['H_MIN'], hsv_config['S_MIN'], hsv_config['V_MIN']])
