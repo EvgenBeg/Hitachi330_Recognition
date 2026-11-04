@@ -158,7 +158,6 @@ class Config:
             "source": 0,
             "rotate": 0,
             "crop": None,
-            "prefer_mjpeg": True,
             "capture": {
                 "width": 1920,
                 "height": 1080,

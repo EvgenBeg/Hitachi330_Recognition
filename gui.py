@@ -72,7 +72,11 @@ class MainApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._no_frame_count = 0
+        self._first_frame_logged = False
+        self._video_was_running_before_measurement = False
+        self._connecting = False
         self._update_camera_buttons()
+        self.root.after(100, self._initial_camera_connect)
 
     # ---------- Масштабирование ----------
     def on_resize(self, event):
@@ -93,6 +97,14 @@ class MainApp:
         scale_x = current_width / self.base_width
         scale_y = current_height / self.base_height
         return scale_x, scale_y
+
+    def _roi_scale(self, frame_w, frame_h):
+        """Коэффициенты масштабирования ROI из ref-разрешения в текущий кадр."""
+        saved_w = int(self.segment_config.get('_ref_width', 0) or 0) if self.segment_config else 0
+        saved_h = int(self.segment_config.get('_ref_height', 0) or 0) if self.segment_config else 0
+        if saved_w > 0 and saved_h > 0 and (saved_w != frame_w or saved_h != frame_h):
+            return frame_w / saved_w, frame_h / saved_h
+        return 1.0, 1.0
 
     # ---------- Вкладки ----------
     def create_tab_buttons(self):
@@ -145,6 +157,11 @@ class MainApp:
             else:
                 btn.config(relief=tk.RAISED, bg='lightgray')
 
+        # Fallback: если камера почему-то не подключилась при старте,
+        # пытаемся подключить при первом заходе на «Измерение».
+        if page_name == "measurement" and not self.camera.connected:
+            self.root.after(100, self._initial_camera_connect)
+
     # ---------- Страница измерения ----------
     def setup_measurement_page(self, page):
         self.measurement_wavelengths = []
@@ -167,7 +184,7 @@ class MainApp:
         self.name_frame = tk.Frame(self.measurement_top_panel)
         self.name_label = tk.Label(self.name_frame, text="Название спектра:", font=('Arial', self.font_size))
         self.name_label.pack(anchor='w')
-        self.spectrum_name_entry = tk.Entry(self.name_frame, width=30, font=('Arial', self.font_size))
+        self.spectrum_name_entry = tk.Entry(self.name_frame, width=25, font=('Arial', self.font_size))
         self.spectrum_name_entry.pack(anchor='w')
 
         self.start_measurement_btn = tk.Button(self.measurement_top_panel, text="Scan",
@@ -278,9 +295,16 @@ class MainApp:
         if self.measurement_running:
             return
         if not self.camera.connected:
-            if not self.camera.connect():
-                messagebox.showerror("Ошибка", "Не удалось подключиться к камере")
-                return
+            # Показываем сообщение и запускаем подключение в фоне —
+            # пользователь нажмёт Scan ещё раз через секунду.
+            self.camera_status_label.config(text="Статус: подключение...")
+            self._initial_camera_connect()
+            messagebox.showinfo(
+                "Подключение",
+                "Камера ещё не подключена. Подключение запущено — "
+                "через 1–2 секунды нажмите Scan ещё раз."
+            )
+            return
         spectrum_name = self.spectrum_name_entry.get().strip()
         if not spectrum_name:
             messagebox.showerror("Ошибка", "Введите название спектра")
@@ -306,6 +330,14 @@ class MainApp:
         self.raw_transmittances = []
         self.graph_update_counter = 0
         self.update_measurement_plot()
+
+        # Автопауза превью на время измерения — чтобы не конкурировать
+        # за кадры с start_recognition
+        self._video_was_running_before_measurement = self.video_running
+        if self.video_running:
+            self._stop_video_loop()
+            self.pause_video_btn.config(text="Продолжить", bg='lightgreen')
+            self.camera_status_label.config(text="Статус: измерение…")
 
         hsv_lower, hsv_upper = self.config.get_hsv_ranges()
 
@@ -364,6 +396,13 @@ class MainApp:
         self.measurement_running = False
         self.start_measurement_btn.config(state=tk.NORMAL)
         self.stop_measurement_btn.config(state=tk.DISABLED)
+        if (getattr(self, '_video_was_running_before_measurement', False)
+                and self.camera.connected):
+            self.video_running = True
+            self.pause_video_btn.config(text="Пауза", bg='lightcoral')
+            self.camera_status_label.config(text="Статус: подключено")
+            self.update_video_frame()
+        self._update_camera_buttons()
         messagebox.showinfo("Готово", "Измерение завершено")
 
     def stop_measurement(self):
@@ -413,13 +452,15 @@ class MainApp:
         if frame is None:
             return
         if self.segment_config and self.roi_config:
+            h_frame, w_frame = frame.shape[:2]
+            rx, ry = self._roi_scale(w_frame, h_frame)
+
             roi1 = self.segment_config['rois'][0]
             roi2 = self.segment_config['rois'][1]
-            x1, y1 = int(roi1['x']), int(roi1['y'])
-            w1, h1 = int(roi1['w']), int(roi1['h'])
-            x2, y2 = int(roi2['x']), int(roi2['y'])
-            w2, h2 = int(roi2['w']), int(roi2['h'])
-            h_frame, w_frame = frame.shape[:2]
+            x1, y1 = int(roi1['x'] * rx), int(roi1['y'] * ry)
+            w1, h1 = int(roi1['w'] * rx), int(roi1['h'] * ry)
+            x2, y2 = int(roi2['x'] * rx), int(roi2['y'] * ry)
+            w2, h2 = int(roi2['w'] * rx), int(roi2['h'] * ry)
 
             x1 = max(0, x1); y1 = max(0, y1)
             w1 = min(w1, w_frame - x1); h1 = min(h1, h_frame - y1)
@@ -440,6 +481,7 @@ class MainApp:
         camera_panel = tk.Frame(page)
         camera_panel.pack(fill=tk.X, padx=10, pady=5)
 
+        # --- Row 1: тип камеры, источник, поворот, кнопки ---
         row1 = tk.Frame(camera_panel)
         row1.pack(fill=tk.X, pady=2)
 
@@ -461,21 +503,49 @@ class MainApp:
                                     command=self.on_rotate_changed)
         rotate_menu.pack(side=tk.LEFT)
 
-        self.connect_camera_btn = tk.Button(row1, text="Подключить",
+        self.connect_camera_btn = tk.Button(row1, text="Перезапустить",
                                             command=self.reconnect_camera,
                                             font=('Arial', 12))
         self.connect_camera_btn.pack(side=tk.LEFT, padx=10)
 
-        self.stop_camera_btn = tk.Button(row1, text="Стоп",
-                                         command=self.stop_video,
+        self.pause_video_btn = tk.Button(row1, text="Пауза",
+                                         command=self.toggle_pause_video,
                                          font=('Arial', 12),
-                                         bg='lightcoral', state=tk.NORMAL)
-        self.stop_camera_btn.pack(side=tk.LEFT, padx=5)
+                                         bg='lightcoral', state=tk.DISABLED)
+        self.pause_video_btn.pack(side=tk.LEFT, padx=5)
 
         self.camera_status_label = tk.Label(row1, text="Статус: не подключено", font=('Arial', 12))
         self.camera_status_label.pack(side=tk.LEFT, padx=10)
 
-        # --- Row 3: X / Y / W / H + Свойства драйвера ---
+        # --- Row 2: разрешение и FPS ---
+        row2 = tk.Frame(camera_panel)
+        row2.pack(fill=tk.X, pady=2)
+
+        tk.Label(row2, text="Разрешение:", font=('Arial', 12)).pack(side=tk.LEFT, padx=5)
+        cap_cfg = self.config.get('camera', 'capture', default={}) or {}
+        default_res = f"{cap_cfg.get('width', 1920)}x{cap_cfg.get('height', 1080)}"
+        self.resolution_var = tk.StringVar(value=default_res)
+        self.resolution_combo = ttk.Combobox(
+            row2, textvariable=self.resolution_var,
+            values=["640x480", "800x600", "1280x720", "1600x900", "1920x1080", "Нативное"],
+            width=12, font=('Arial', 12), state="normal"
+        )
+        self.resolution_combo.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(row2, text="FPS:", font=('Arial', 12)).pack(side=tk.LEFT, padx=(20, 5))
+        default_fps = str(cap_cfg.get('fps', 30))
+        self.fps_var = tk.StringVar(value=default_fps)
+        self.fps_combo = ttk.Combobox(
+            row2, textvariable=self.fps_var,
+            values=["5", "10", "15", "24", "30", "60", "Нативное"],
+            width=8, font=('Arial', 12), state="normal"
+        )
+        self.fps_combo.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(row2, text="(при изменении разрешения — перекалибруйте ROI)",
+                 font=('Arial', 9), fg='gray').pack(side=tk.LEFT, padx=10)
+
+        # --- Row 3: Crop X/Y/W/H + свойства драйвера ---
         row3 = tk.Frame(camera_panel)
         row3.pack(fill=tk.X, pady=2)
 
@@ -562,7 +632,6 @@ class MainApp:
         return f"x={crop['x']}, y={crop['y']}, w={crop['w']}, h={crop['h']}"
 
     def load_crop_to_ui(self):
-        """Загружает сохранённый crop в поля ввода."""
         crop = self.config.get('camera', 'crop', default=None)
         if crop:
             self.crop_x_var.set(str(crop['x']))
@@ -593,7 +662,15 @@ class MainApp:
             messagebox.showerror("Ошибка", "W и H должны быть не меньше 10")
             return
         x = max(0, x); y = max(0, y)
-        crop = {'x': x, 'y': y, 'w': w, 'h': h}
+        # ref_width/ref_height — текущее разрешение камеры.
+        # По ним crop масштабируется при смене разрешения.
+        try:
+            ref_w = int(self.camera.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            ref_h = int(self.camera.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        except Exception:
+            ref_w, ref_h = 1920, 1080
+        crop = {'x': x, 'y': y, 'w': w, 'h': h,
+                'ref_width': ref_w, 'ref_height': ref_h}
         self.config.set('camera', 'crop', value=crop)
         self.config.save()
         self.camera.crop = crop
@@ -623,11 +700,29 @@ class MainApp:
         self.apply_crop()
 
     def reset_crop_area(self):
-        self.config.set('camera', 'crop', value=None)
+        """Сбрасывает crop до размеров всего текущего кадра.
+        Поля X/Y/W/H и информация обновляются; crop остаётся включённым."""
+        try:
+            frame_w = int(self.camera.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_h = int(self.camera.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        except Exception:
+            frame_w, frame_h = 1920, 1080
+        if frame_w <= 0 or frame_h <= 0:
+            frame_w, frame_h = 1920, 1080
+
+        crop = {
+            'x': 0, 'y': 0, 'w': frame_w, 'h': frame_h,
+            'ref_width': frame_w, 'ref_height': frame_h
+        }
+        self.config.set('camera', 'crop', value=crop)
         self.config.save()
-        self.camera.crop = None
-        self.crop_enabled_var.set(False)
-        self.crop_info_var.set("весь кадр")
+        self.camera.crop = crop
+        self.crop_enabled_var.set(True)
+        self.crop_x_var.set("0")
+        self.crop_y_var.set("0")
+        self.crop_w_var.set(str(frame_w))
+        self.crop_h_var.set(str(frame_h))
+        self.crop_info_var.set(self._get_text_crop(crop))
 
     def on_camera_type_changed(self):
         if self.camera_type_var.get() == 'webcam':
@@ -649,6 +744,46 @@ class MainApp:
             self.camera.rotate_code = cv2.ROTATE_90_COUNTERCLOCKWISE
         else:
             self.camera.rotate_code = None
+
+    def _initial_camera_connect(self):
+        """Подключает камеру в фоновом потоке, чтобы не морозить GUI.
+        cap.set(W/H) на DirectShow занимает 0.5–2 с, а read() на «холодной»
+        камере может ждать первый кадр неограниченно — всё это в потоке."""
+        if self.camera.connected or self.measurement_running or self._connecting:
+            return
+        self._connecting = True
+        self.camera_status_label.config(text="Статус: подключение...")
+
+        cap_cfg = self.config.get('camera', 'capture', default={}) or {}
+        self.camera.capture_width = int(cap_cfg.get('width', 0) or 0)
+        self.camera.capture_height = int(cap_cfg.get('height', 0) or 0)
+        self.camera.capture_fps = int(cap_cfg.get('fps', 0) or 0)
+
+        def worker():
+            ok = False
+            try:
+                ok = self.camera.connect()
+            except Exception as e:
+                print(f"[init] Ошибка подключения: {e}")
+            # Возвращаемся в главный поток для UI
+            self.root.after(0, lambda: self._on_initial_connect_done(ok))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_initial_connect_done(self, ok):
+        """Вызывается из главного потока после завершения camera.connect()."""
+        self._connecting = False
+        if ok:
+            self.video_running = True
+            self._no_frame_count = 0
+            self._first_frame_logged = False
+            self.camera_status_label.config(text="Статус: подключено")
+            self._update_camera_buttons()
+            self.update_video_frame()
+            print("[init] Камера подключена")
+        else:
+            self.camera_status_label.config(text="Статус: ошибка подключения")
+            print("[init] Не удалось подключить камеру")
 
     def reconnect_camera(self):
         if self.measurement_running:
@@ -674,9 +809,33 @@ class MainApp:
         self.camera.rotate_code = self.config.get_camera_rotate_code()
         self.camera.crop = self.config.get('camera', 'crop', default=None)
 
+        # --- Разрешение и FPS из UI ---
+        w, h = 0, 0
+        res_text = self.resolution_var.get().strip().lower()
+        if res_text and res_text != "нативное":
+            try:
+                w_str, h_str = res_text.split('x')
+                w = int(w_str)
+                h = int(h_str)
+            except (ValueError, AttributeError):
+                messagebox.showerror("Ошибка", "Разрешение должно быть в формате 1920x1080")
+                return
+
+        fps_val = 0
+        fps_text = self.fps_var.get().strip().lower()
+        if fps_text and fps_text != "нативное":
+            try:
+                fps_val = int(float(fps_text))
+            except ValueError:
+                messagebox.showerror("Ошибка", "FPS должен быть числом")
+                return
+
+        self.camera.capture_width = w
+        self.camera.capture_height = h
+        self.camera.capture_fps = fps_val
+
         ok = self.camera.connect()
         if not ok:
-            # DSHOW иногда не отпускает устройство мгновенно — пробуем ещё раз
             self.camera_status_label.config(text="Статус: повторная попытка...")
             self.root.update_idletasks()
             time.sleep(0.8)
@@ -686,10 +845,15 @@ class MainApp:
             self.camera_status_label.config(text="Статус: подключено")
             self.video_running = True
             self._no_frame_count = 0
+            self._first_frame_logged = False
             self.update_video_frame()
 
+            # Сохраняем настройки
             self.config.set('camera', 'source_type', value=source_type)
             self.config.set('camera', 'source', value=source)
+            self.config.set('camera', 'capture', 'width', value=w if w > 0 else 0)
+            self.config.set('camera', 'capture', 'height', value=h if h > 0 else 0)
+            self.config.set('camera', 'capture', 'fps', value=fps_val if fps_val > 0 else 0)
             self.config.save()
         else:
             self.camera_status_label.config(text="Статус: ошибка подключения")
@@ -737,10 +901,23 @@ class MainApp:
         self._no_frame_count = 0
         fh, fw = frame.shape[:2]
 
+        if not self._first_frame_logged:
+            self._first_frame_logged = True
+            mean = float(frame.mean()) if frame.size else 0.0
+            print(f"[video] первый кадр: shape={frame.shape} "
+                  f"(h={fh}, w={fw}), mean={mean:.1f}")
+
         # Затемнение вокруг crop — только в режиме «полный кадр»
         if crop_active and show_full:
-            cx, cy = int(crop['x']), int(crop['y'])
-            cw, ch = int(crop['w']), int(crop['h'])
+            # Масштабируем сохранённые координаты crop в текущее разрешение кадра
+            ref_w = int(crop.get('ref_width', fw) or fw)
+            ref_h = int(crop.get('ref_height', fh) or fh)
+            sx = fw / ref_w if ref_w > 0 else 1.0
+            sy = fh / ref_h if ref_h > 0 else 1.0
+            cx = int(crop['x'] * sx)
+            cy = int(crop['y'] * sy)
+            cw = int(crop['w'] * sx)
+            ch = int(crop['h'] * sy)
             x2 = min(cx + cw, fw)
             y2 = min(cy + ch, fh)
             cx = max(0, cx); cy = max(0, cy)
@@ -757,49 +934,69 @@ class MainApp:
         if self.segment_config and self.roi_config:
             roi1 = self.segment_config['rois'][0]
             roi2 = self.segment_config['rois'][1]
+
+            # Масштаб ROI относительно ref-разрешения crop-кадра
+            saved_w = int(self.segment_config.get('_ref_width', 0) or 0)
+            saved_h = int(self.segment_config.get('_ref_height', 0) or 0)
+            if apply_crop_now:
+                # frame — это crop-кадр, его размер соответствует текущему crop
+                cur_w, cur_h = fw, fh
+            else:
+                # frame — полный кадр; вычислим размер, который был бы у crop-кадра
+                ref_w = int(crop.get('ref_width', fw) or fw) if crop_active else fw
+                ref_h = int(crop.get('ref_height', fh) or fh) if crop_active else fh
+                sx_c = fw / ref_w if ref_w > 0 else 1.0
+                sy_c = fh / ref_h if ref_h > 0 else 1.0
+                cur_w = int(int(crop['w']) * sx_c) if crop_active else fw
+                cur_h = int(int(crop['h']) * sy_c) if crop_active else fh
+
+            if saved_w > 0 and saved_h > 0 and (saved_w != cur_w or saved_h != cur_h):
+                rx = cur_w / saved_w
+                ry = cur_h / saved_h
+            else:
+                rx = ry = 1.0
+
             if apply_crop_now:
                 off_x, off_y = 0, 0
             else:
-                off_x = int(crop['x']) if crop_active else 0
-                off_y = int(crop['y']) if crop_active else 0
+                ref_w = int(crop.get('ref_width', fw) or fw) if crop_active else fw
+                ref_h = int(crop.get('ref_height', fh) or fh) if crop_active else fh
+                sx_c = fw / ref_w if ref_w > 0 else 1.0
+                sy_c = fh / ref_h if ref_h > 0 else 1.0
+                off_x = int(crop['x'] * sx_c) if crop_active else 0
+                off_y = int(crop['y'] * sy_c) if crop_active else 0
 
-            # Размер квадратиков сегментов — из segment_config (или 9 по умолчанию)
             seg_size = int(self.segment_config.get('_seg_size', 9))
             seg_size = max(5, min(seg_size, 40))
-
-            cv2.rectangle(frame,
-                          (off_x + roi1['x'], off_y + roi1['y']),
-                          (off_x + roi1['x'] + roi1['w'],
-                           off_y + roi1['y'] + roi1['h']),
-                          (255, 0, 0), 2)
-            cv2.rectangle(frame,
-                          (off_x + roi2['x'], off_y + roi2['y']),
-                          (off_x + roi2['x'] + roi2['w'],
-                           off_y + roi2['y'] + roi2['h']),
-                          (0, 255, 0), 2)
+            seg_size_sx = max(3, int(seg_size * rx))
+            seg_size_sy = max(3, int(seg_size * ry))
 
             for roi_data in (roi1, roi2):
+                r_x = int(roi_data['x'] * rx)
+                r_y = int(roi_data['y'] * ry)
+                r_w = int(roi_data['w'] * rx)
+                r_h = int(roi_data['h'] * ry)
+                cv2.rectangle(frame,
+                              (off_x + r_x, off_y + r_y),
+                              (off_x + r_x + r_w, off_y + r_y + r_h),
+                              (0, 255, 255), 2)
+
                 for digit in roi_data['digits']:
                     for seg in digit['segments']:
-                        x = int(off_x + roi_data['x']
-                                + seg['x'] * roi_data['w'])
-                        y = int(off_y + roi_data['y']
-                                + seg['y'] * roi_data['h'])
+                        x = int(off_x + r_x + seg['x'] * r_w)
+                        y = int(off_y + r_y + seg['y'] * r_h)
                         cv2.rectangle(frame, (x, y),
-                                      (x + seg_size, y + seg_size),
+                                      (x + seg_size_sx, y + seg_size_sy),
                                       (0, 255, 255), 1)
 
-                # Точка (десятичный разделитель)
                 if 'point' in roi_data:
-                    px = int(off_x + roi_data['x']
-                             + roi_data['point']['x'] * roi_data['w'])
-                    py = int(off_y + roi_data['y']
-                             + roi_data['point']['y'] * roi_data['h'])
+                    px = int(off_x + r_x + roi_data['point']['x'] * r_w)
+                    py = int(off_y + r_y + roi_data['point']['y'] * r_h)
                     cv2.rectangle(frame, (px, py),
-                                  (px + seg_size, py + seg_size),
-                                  (0, 128, 255), 1)   # оранжевый — чтобы отличать
+                                  (px + seg_size_sx, py + seg_size_sy),
+                                  (0, 128, 255), 1)
 
-        # Масштаб под окно: fill = зум-эффект для обрезанного кадра
+        # Масштаб под окно
         label_w = self.video_label.winfo_width()
         label_h = self.video_label.winfo_height()
         if label_w > 1 and label_h > 1:
@@ -815,7 +1012,36 @@ class MainApp:
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
+        # На вкладке «Измерение» до начала Scan — показываем
+        # живое превью ROI, чтобы пользователь мог навестись.
+        if (self.current_page == "measurement"
+                and not self.measurement_running
+                and self.segment_config and self.roi_config):
+            # Используем исходный (не ресайзенный) кадр — ROI обрезаются
+            # по координатам из segment_config в исходном разрешении.
+            raw_ret, raw_frame = self.camera.read(apply_crop=apply_crop_now)
+            if raw_ret and raw_frame is not None:
+                self.update_measurement_roi(raw_frame)
+
         self.video_after_id = self.root.after(30, self.update_video_frame)
+
+    def toggle_pause_video(self):
+        """Toggle: превью ↔ пауза. Камера остаётся открытой в обоих режимах."""
+        if not self.camera.connected:
+            return
+        if self.video_running:
+            # Пауза
+            self._stop_video_loop()
+            self.pause_video_btn.config(text="Продолжить", bg='lightgreen')
+            self.camera_status_label.config(text="Статус: пауза")
+        else:
+            # Продолжить
+            self.video_running = True
+            self._no_frame_count = 0
+            self.pause_video_btn.config(text="Пауза", bg='lightcoral')
+            self.camera_status_label.config(text="Статус: подключено")
+            self.update_video_frame()
+        self._update_camera_buttons()
 
     def _stop_video_loop(self):
         self.video_running = False
@@ -853,15 +1079,18 @@ class MainApp:
         self._update_camera_buttons()
 
     def _update_camera_buttons(self):
-        if self.video_running:
-            self.stop_camera_btn.config(state=tk.NORMAL)
+        if not self.camera.connected:
+            self.pause_video_btn.config(state=tk.DISABLED, text="Пауза",
+                                        bg='lightcoral')
         else:
-            self.stop_camera_btn.config(state=tk.DISABLED)
+            self.pause_video_btn.config(state=tk.NORMAL)
+            if self.video_running:
+                self.pause_video_btn.config(text="Пауза", bg='lightcoral')
+            else:
+                self.pause_video_btn.config(text="Продолжить", bg='lightgreen')
 
     def open_driver_settings(self):
-        """Открывает системный диалог свойств драйвера DirectShow.
-        Там доступны все параметры, которые поддерживает камера:
-        экспозиция, яркость, контраст, баланс белого, зум, фокус и т.п."""
+        """Открывает системный диалог свойств драйвера DirectShow."""
         if not self.camera.connected or self.camera.cap is None:
             messagebox.showwarning(
                 "Камера не подключена",
@@ -1097,27 +1326,53 @@ class MainApp:
             self.config.save()
 
     def open_roi_config(self):
+        was_running = self.video_running
+        if was_running:
+            self._stop_video_loop()
+
         rotate_code = self.config.get_camera_rotate_code()
         crop = self.config.get('camera', 'crop', default=None)
         seg_path = self.config.get_absolute_path('segment_config')
         roi_path = self.config.get_absolute_path('roi_config')
-        calibration.segment_calibration(
-            camera_index=self.config.get('camera', 'source', default=0),
-            segment_file=seg_path, roi_file=roi_path,
-            rotate_code=rotate_code, crop=crop
-        )
+        try:
+            calibration.segment_calibration(
+                camera_cap=self.camera.cap if self.camera.connected else None,
+                camera_index=self.config.get('camera', 'source', default=0),
+                segment_file=seg_path, roi_file=roi_path,
+                rotate_code=rotate_code, crop=crop
+            )
+        finally:
+            if was_running and self.camera.connected:
+                self.video_running = True
+                self.pause_video_btn.config(text="Пауза", bg='lightcoral')
+                self.update_video_frame()
+                self._update_camera_buttons()
+
         self.segment_config = load_json(seg_path)
         self.roi_config = load_json(roi_path)
 
     def open_color_config(self):
+        was_running = self.video_running
+        if was_running:
+            self._stop_video_loop()
+
         rotate_code = self.config.get_camera_rotate_code()
         crop = self.config.get('camera', 'crop', default=None)
         hsv_path = self.config.get_absolute_path('hsv_config')
-        calibration.color_calibration(
-            camera_index=self.config.get('camera', 'source', default=0),
-            config_file=hsv_path,
-            rotate_code=rotate_code, crop=crop
-        )
+        try:
+            calibration.color_calibration(
+                camera_cap=self.camera.cap if self.camera.connected else None,
+                camera_index=self.config.get('camera', 'source', default=0),
+                config_file=hsv_path,
+                rotate_code=rotate_code, crop=crop
+            )
+        finally:
+            if was_running and self.camera.connected:
+                self.video_running = True
+                self.pause_video_btn.config(text="Пауза", bg='lightcoral')
+                self.update_video_frame()
+                self._update_camera_buttons()
+
         hsv_config = load_json(hsv_path)
         if hsv_config:
             self.config.set('hsv', 'lower',
