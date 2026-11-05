@@ -967,7 +967,7 @@ class MainApp:
                 off_y = int(crop['y'] * sy_c) if crop_active else 0
 
             seg_size = int(self.segment_config.get('_seg_size', 9))
-            seg_size = max(5, min(seg_size, 40))
+            seg_size = max(1, min(seg_size, 40))
             seg_size_sx = max(3, int(seg_size * rx))
             seg_size_sy = max(3, int(seg_size * ry))
 

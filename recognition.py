@@ -19,7 +19,19 @@ def load_json(filename):
         return json.load(f)
 
 
-def recognize_digit(binary_frame, roi, digit_idx, roi_cfg, threshold=0.30):
+def _compute_roi_scale(segment_config, frame_w, frame_h):
+    """Коэффициенты масштабирования ROI из ref-разрешения в текущий кадр.
+    Нужны, чтобы ROI, сохранённые при 1920×1080, корректно работали при 640×480
+    и наоборот. Тот же подход, что в gui._roi_scale."""
+    saved_w = int(segment_config.get('_ref_width', 0) or 0)
+    saved_h = int(segment_config.get('_ref_height', 0) or 0)
+    if saved_w > 0 and saved_h > 0 and (saved_w != frame_w or saved_h != frame_h):
+        return frame_w / saved_w, frame_h / saved_h
+    return 1.0, 1.0
+
+
+def recognize_digit(binary_frame, roi, digit_idx, roi_cfg,
+                    threshold=0.30, size=9):
     states = []
     for seg in roi['digits'][digit_idx]['segments']:
         abs_x = roi['x'] + seg['x'] * roi['w']
@@ -36,12 +48,12 @@ def recognize_digit(binary_frame, roi, digit_idx, roi_cfg, threshold=0.30):
         dy = y - cy
         x = cx + dx * math.cos(rad) - dy * math.sin(rad)
         y = cy + dx * math.sin(rad) + dy * math.cos(rad)
-        state = is_segment_on(binary_frame, x, y, size=9, threshold=threshold)
+        state = is_segment_on(binary_frame, x, y, size=size, threshold=threshold)
         states.append(state)
     return digit_from_states(states)
 
 
-def recognize_point(binary_frame, roi, roi_cfg, threshold=0.20):
+def recognize_point(binary_frame, roi, roi_cfg, threshold=0.20, size=9):
     if 'point' not in roi:
         return False
     abs_x = roi['x'] + roi['point']['x'] * roi['w']
@@ -58,7 +70,8 @@ def recognize_point(binary_frame, roi, roi_cfg, threshold=0.20):
     dy = y - cy
     x = cx + dx * math.cos(rad) - dy * math.sin(rad)
     y = cy + dx * math.sin(rad) + dy * math.cos(rad)
-    return point_is_on(binary_frame, x, y, size=9, threshold=threshold)
+    return point_is_on(binary_frame, x, y, size=size, threshold=threshold)
+
 
 def _get_ordinate_name(mode):
     """Возвращает название столбца ординат в зависимости от режима."""
@@ -70,6 +83,7 @@ def _get_ordinate_name(mode):
         return 'Optical density'
     else:
         return 'Value'
+
 
 def _write_metadata(writer, mode, scan_speed, scale_min, scale_max, comment):
     """Записывает метаданные измерения и заголовок таблицы в CSV."""
@@ -96,25 +110,60 @@ def start_recognition(camera, segment_config, roi_config, hsv_lower, hsv_upper,
                       stop_event=None, data_callback=None, frame_callback=None):
     """
     Запускает процесс распознавания и записи спектра.
+
+    Важно: roi_config / segment_config содержат абсолютные координаты ROI
+    в разрешении, при котором калибровали (_ref_width/_ref_height).
+    Если камера сейчас отдаёт другое разрешение, координаты масштабируются
+    автоматически, чтобы распознавание читало те же участки сцены.
     """
     roi1 = segment_config['rois'][0]
     roi2 = segment_config['rois'][1]
     roi1_cfg = roi_config['roi1']
     roi2_cfg = roi_config['roi2']
 
-    roi1['x'] = roi1_cfg['x']
-    roi1['y'] = roi1_cfg['y']
-    roi1['w'] = roi1_cfg['w']
-    roi1['h'] = roi1_cfg['h']
-    roi2['x'] = roi2_cfg['x']
-    roi2['y'] = roi2_cfg['y']
-    roi2['w'] = roi2_cfg['w']
-    roi2['h'] = roi2_cfg['h']
+    # ---- Размер сегмента из мастера калибровки ----
+    seg_size = int(segment_config.get('_seg_size', 9))
+    seg_size = max(1, min(seg_size, 40))
+    print(f"Размер сегмента (из мастера): {seg_size}")
+
+    # ---- Первое чтение кадра: нужно для определения разрешения и масштаба ----
+    ret, first_frame = camera.read()
+    if not ret or first_frame is None:
+        print("Не удалось получить первый кадр — прерываем измерение")
+        return None
+    fh, fw = first_frame.shape[:2]
+    print(f"Разрешение кадра: {fw}x{fh}")
+
+    # ---- Коэффициенты масштабирования ROI под текущее разрешение ----
+    rx, ry = _compute_roi_scale(segment_config, fw, fh)
+    if rx != 1.0 or ry != 1.0:
+        print(f"ROI масштабируются: rx={rx:.3f}, ry={ry:.3f} "
+              f"(ref={segment_config.get('_ref_width')}x"
+              f"{segment_config.get('_ref_height')} → {fw}x{fh})")
+
+    # Применяем масштаб к ROI. Дальше работаем с уже масштабированными
+    # координатами — recognize_digit/recognize_point получают их как есть.
+    def scale_roi(roi, roi_cfg):
+        roi['x'] = int(roi_cfg['x'] * rx)
+        roi['y'] = int(roi_cfg['y'] * ry)
+        roi['w'] = int(roi_cfg['w'] * rx)
+        roi['h'] = int(roi_cfg['h'] * ry)
+
+    scale_roi(roi1, roi1_cfg)
+    scale_roi(roi2, roi2_cfg)
+
+    # Масштабируем и seg_size под текущее разрешение (если ref != cur)
+    seg_size_rx = max(1, int(round(seg_size * rx)))
+    seg_size_ry = max(1, int(round(seg_size * ry)))
+    # is_segment_on использует квадрат size×size, берём среднее
+    seg_size_scaled = max(1, (seg_size_rx + seg_size_ry) // 2)
+    if seg_size_scaled != seg_size:
+        print(f"Размер сегмента после масштабирования: {seg_size_scaled}")
 
     raw_data = []
     processed_data = defaultdict(lambda: deque(maxlen=5))
     last_wavelength = None
-    start_wavelength = None          # длина волны, с которой началось измерение
+    start_wavelength = None
     consecutive_jumps = 0
     rejected_count = 0
 
@@ -127,18 +176,26 @@ def start_recognition(camera, segment_config, roi_config, hsv_lower, hsv_upper,
     print(f"Сырые данные: {raw_csv_path}")
     print(f"Диапазон длины волны: [{min_wavelength}, {max_wavelength}] нм")
 
+    # Первый кадр уже получен — используем его как стартовый,
+    # чтобы не терять данные.
+    pending_frame = first_frame
+
     while True:
         if stop_event is not None and stop_event.is_set():
             print("Остановлено пользователем")
             break
 
-        ret, frame = camera.read()
-        if not ret:
-            print("Не удалось получить кадр, попытка переподключения...")
-            if not camera.reconnect():
-                print("Не удалось переподключиться к камере")
-                break
-            continue
+        if pending_frame is not None:
+            frame = pending_frame
+            pending_frame = None
+        else:
+            ret, frame = camera.read()
+            if not ret:
+                print("Не удалось получить кадр, попытка переподключения...")
+                if not camera.reconnect():
+                    print("Не удалось переподключиться к камере")
+                    break
+                continue
 
         if frame_callback:
             frame_callback(frame.copy())
@@ -148,9 +205,13 @@ def start_recognition(camera, segment_config, roi_config, hsv_lower, hsv_upper,
         # ---- Длина волны (ROI1) ----
         wavelength_digits = []
         for i in range(4):
-            digit = recognize_digit(binary_frame, roi1, i, roi1_cfg, fill_threshold_digit)
+            digit = recognize_digit(binary_frame, roi1, i, roi1_cfg,
+                                    fill_threshold_digit,
+                                    size=seg_size_scaled)
             wavelength_digits.append(digit)
-        point_on_wl = recognize_point(binary_frame, roi1, roi1_cfg, fill_threshold_point)
+        point_on_wl = recognize_point(binary_frame, roi1, roi1_cfg,
+                                      fill_threshold_point,
+                                      size=seg_size_scaled)
 
         wavelength = ""
         if all(d != '?' and d != '' for d in wavelength_digits):
@@ -161,9 +222,13 @@ def start_recognition(camera, segment_config, roi_config, hsv_lower, hsv_upper,
         # ---- Пропускание (ROI2) ----
         transmittance_digits = []
         for i in range(4):
-            digit = recognize_digit(binary_frame, roi2, i, roi2_cfg, fill_threshold_digit)
+            digit = recognize_digit(binary_frame, roi2, i, roi2_cfg,
+                                    fill_threshold_digit,
+                                    size=seg_size_scaled)
             transmittance_digits.append(digit)
-        point_on_tr = recognize_point(binary_frame, roi2, roi2_cfg, fill_threshold_point)
+        point_on_tr = recognize_point(binary_frame, roi2, roi2_cfg,
+                                      fill_threshold_point,
+                                      size=seg_size_scaled)
 
         while transmittance_digits and transmittance_digits[0] == '':
             transmittance_digits.pop(0)
@@ -183,8 +248,6 @@ def start_recognition(camera, segment_config, roi_config, hsv_lower, hsv_upper,
                 continue
 
             # ===== 1. ОСТАНОВКА: нижняя граница =====
-            # ЭТУ проверку делаем ПЕРВОЙ, чтобы поймать момент,
-            # когда прибор ушёл ниже min_wavelength (даже если это "ошибка")
             if wl_val <= min_wavelength:
                 print(f"Достигнута нижняя граница {min_wavelength} нм "
                       f"(λ={wl_val:.1f}). Завершение.")
@@ -217,26 +280,20 @@ def start_recognition(camera, segment_config, roi_config, hsv_lower, hsv_upper,
                 continue
 
             # ===== 5. Фильтр "измерение идёт вниз" =====
-            # Допуск вверх: 2 нм (для дрожания показаний)
             ASCENT_TOLERANCE = 2.0
 
-            # Если новое значение выше начального — это ошибка OCR
             if wl_val > start_wavelength + ASCENT_TOLERANCE:
                 rejected_count += 1
                 print(f"λ={wl_val:.1f} выше стартовой {start_wavelength:.1f}, "
                       f"пропуск (ошибка распознавания)")
                 continue
 
-            # Если новое значение выше предыдущего более чем на 2 нм —
-            # это тоже ошибка (измерение идёт вниз)
             if wl_val > last_wavelength + ASCENT_TOLERANCE:
                 rejected_count += 1
                 print(f"λ={wl_val:.1f} выше предыдущей {last_wavelength:.1f}, "
                       f"пропуск (ошибка распознавания)")
                 continue
 
-            # Если значение упало слишком резко (больше max_step_down за кадр) —
-            # это тоже ошибка, но здесь скорее нужен порог "плавности"
             if last_wavelength - wl_val > wavelength_jump_threshold:
                 consecutive_jumps += 1
                 if consecutive_jumps < 3:
@@ -244,7 +301,6 @@ def start_recognition(camera, segment_config, roi_config, hsv_lower, hsv_upper,
                     print(f"λ={wl_val:.1f} резко ниже {last_wavelength:.1f}, "
                           f"пропуск ({consecutive_jumps}/3)")
                     continue
-                # Три подряд — значит это реальное быстрое движение
             else:
                 consecutive_jumps = 0
 

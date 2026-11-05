@@ -300,8 +300,9 @@ def segment_calibration(camera_cap=None, camera_index=0,
             _r['x'] = max(0, min(int(_r['x']), frame_w - _r['w']))
             _r['y'] = max(0, min(int(_r['y']), frame_h - _r['h']))
 
+    # Мин. размер сегмента = 1 (было 5)
     if '_seg_size' in config:
-        current_seg_size = max(5, min(int(config['_seg_size']), 40))
+        current_seg_size = max(1, min(int(config['_seg_size']), 40))
         seg_size = current_seg_size
 
     current_roi = 0
@@ -336,7 +337,8 @@ def segment_calibration(camera_cap=None, camera_index=0,
     def create_seg_size_trackbar():
         cv2.createTrackbar(seg_size_track, settings_window,
                            int(current_seg_size), 40, lambda x: None)
-        cv2.setTrackbarMin(seg_size_track, settings_window, 5)
+        # Мин. размер сегмента = 1 (было 5)
+        cv2.setTrackbarMin(seg_size_track, settings_window, 1)
 
     def clear_trackbars():
         cv2.destroyWindow(settings_window)
@@ -368,6 +370,7 @@ def segment_calibration(camera_cap=None, camera_index=0,
         if step == 0:
             create_roi_trackbars(roi)
         elif step == 1:
+            # Номера на квадратиках — ТОЛЬКО на этом шаге (форма сегментов)
             create_seg_size_trackbar()
             cx, cy = frame_w // 2, frame_h // 2
             if base_offsets is None:
@@ -391,6 +394,7 @@ def segment_calibration(camera_cap=None, camera_index=0,
                                                    current_seg_size,
                                                    label=str(idx + 1)))
         elif step in [2, 3, 4, 5]:
+            # Без номеров
             digit_idx = step - 2
             if digit_idx == 0:
                 digit = roi['digits'][0]
@@ -402,27 +406,29 @@ def segment_calibration(camera_cap=None, camera_index=0,
                 current_rects.append(DraggableRect(abs_x, abs_y,
                                                    current_seg_size,
                                                    current_seg_size,
-                                                   label=str(idx + 1)))
+                                                   label=""))
             group_drag = True
         elif step == 6:
+            # Без номера
             pt = roi['point']
             abs_x, abs_y = rel_to_abs(roi, pt['x'], pt['y'])
             current_rects.append(DraggableRect(abs_x, abs_y,
                                                current_seg_size,
-                                               current_seg_size, label='P'))
+                                               current_seg_size, label=""))
         elif step == 7:
+            # Без номеров
             for digit in roi['digits']:
                 for idx, seg in enumerate(digit['segments']):
                     abs_x, abs_y = rel_to_abs(roi, seg['x'], seg['y'])
                     current_rects.append(DraggableRect(abs_x, abs_y,
                                                        current_seg_size,
                                                        current_seg_size,
-                                                       label=str(idx + 1)))
+                                                       label=""))
             pt = roi['point']
             abs_x, abs_y = rel_to_abs(roi, pt['x'], pt['y'])
             current_rects.append(DraggableRect(abs_x, abs_y,
                                                current_seg_size,
-                                               current_seg_size, label='P'))
+                                               current_seg_size, label=""))
             group_drag = True
 
     def mouse_callback(event, x, y, flags, param):
@@ -538,7 +544,7 @@ def segment_calibration(camera_cap=None, camera_index=0,
 
             if step == 1:
                 try:
-                    seg_size = max(5, cv2.getTrackbarPos(seg_size_track,
+                    seg_size = max(1, cv2.getTrackbarPos(seg_size_track,
                                                         settings_window))
                     current_seg_size = seg_size
                 except cv2.error:
@@ -601,8 +607,6 @@ def segment_calibration(camera_cap=None, camera_index=0,
                         print("Переходим ко второму ROI")
                     else:
                         config['_seg_size'] = int(current_seg_size)
-                        # Запоминаем, в каком размере crop-кадра калибровали.
-                        # При смене разрешения ROI будет масштабироваться.
                         config['_ref_width'] = int(frame_w)
                         config['_ref_height'] = int(frame_h)
                         save_json(config, segment_file)
